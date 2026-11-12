@@ -219,6 +219,12 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
 
 /// Asks macOS what is playing and turns the album cover into a small colour palette.
 /// macOS only answers Now Playing queries from Apple's own tools, so the question is asked through osascript.
+/// A small grid of the album cover's colours, top row first, used to draw the cover out of dots.
+struct CoverPixels {
+    let side: Int
+    let colors: [(r: CGFloat, g: CGFloat, b: CGFloat)]
+}
+
 final class AlbumColorWatcher: @unchecked Sendable {
     private let queue = DispatchQueue(label: "audiowallpaper.nowplaying")
     private let lock = NSLock()
@@ -226,6 +232,7 @@ final class AlbumColorWatcher: @unchecked Sendable {
     private var busy = false
     private var hasUpdate = false
     private var pending: [CGColor]?
+    private var pendingCover: CGImage?
 
     private let script = """
     function run(argv) {
@@ -328,19 +335,41 @@ final class AlbumColorWatcher: @unchecked Sendable {
     }
 
     /// Returns new colours once after each change. `colors == nil` means "back to the default look".
-    func takeUpdate() -> (changed: Bool, colors: [CGColor]?) {
+    func takeUpdate() -> (changed: Bool, colors: [CGColor]?, cover: CGImage?) {
         lock.lock()
         defer { lock.unlock() }
-        if !hasUpdate { return (false, nil) }
+        if !hasUpdate { return (false, nil, nil) }
         hasUpdate = false
-        return (true, pending)
+        return (true, pending, pendingCover)
     }
 
-    private func publish(_ colors: [CGColor]?) {
+    private func publish(_ colors: [CGColor]?, art: Data? = nil) {
+        let cover = art.flatMap { NSImage(data: $0)?.cgImage(forProposedRect: nil, context: nil, hints: nil) }
         lock.lock()
         pending = colors
+        pendingCover = cover
         hasUpdate = true
         lock.unlock()
+    }
+
+    /// Shrinks the cover to a grid of colours, one per dot.
+    static func coverPixels(from cg: CGImage, side: Int) -> CoverPixels? {
+        guard side > 0,
+              let ctx = CGContext(data: nil, width: side, height: side, bitsPerComponent: 8,
+                                  bytesPerRow: side * 4, space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        ctx.interpolationQuality = .high
+        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: side, height: side))
+        guard let raw = ctx.data else { return nil }
+        let px = raw.bindMemory(to: UInt8.self, capacity: side * side * 4)
+        var colors: [(r: CGFloat, g: CGFloat, b: CGFloat)] = []
+        colors.reserveCapacity(side * side)
+        for i in 0..<(side * side) {
+            colors.append((r: CGFloat(px[i * 4]) / 255,
+                           g: CGFloat(px[i * 4 + 1]) / 255,
+                           b: CGFloat(px[i * 4 + 2]) / 255))
+        }
+        return CoverPixels(side: side, colors: colors)
     }
 
     private func fetch() {
@@ -354,7 +383,7 @@ final class AlbumColorWatcher: @unchecked Sendable {
                    let art = try? Data(contentsOf: url),
                    let colors = AlbumColorWatcher.palette(from: art) {
                     lastKey = key
-                    publish(colors)
+                    publish(colors, art: art)
                 }
                 return
             }
@@ -369,7 +398,7 @@ final class AlbumColorWatcher: @unchecked Sendable {
                 if lines.count >= 2,
                    let art = try? Data(contentsOf: URL(fileURLWithPath: artPath)),
                    let colors = AlbumColorWatcher.palette(from: art) {
-                    publish(colors)
+                    publish(colors, art: art)
                 } else {
                     publish(nil)
                 }
@@ -391,7 +420,7 @@ final class AlbumColorWatcher: @unchecked Sendable {
            let art = Data(base64Encoded: lines[lines.count - 1], options: .ignoreUnknownCharacters),
            let colors = AlbumColorWatcher.palette(from: art) {
             lastKey = key
-            publish(colors)
+            publish(colors, art: art)
         }
     }
 
@@ -541,7 +570,7 @@ func estimatedDockWidth() -> CGFloat {
 // MARK: - Drawing
 
 enum WaveStyle: Int {
-    case wave = 0, bars = 1, orb = 2
+    case wave = 0, bars = 1, orb = 2, cover = 3
 }
 
 enum OrbShape: Int, CaseIterable {
@@ -684,6 +713,25 @@ final class VisualizerView: NSView {
     }
     private var bars: Bool { style == .bars }
 
+    // Album cover drawn out of dots in the middle of the screen.
+    private let coverLayer = CALayer()
+    var coverImage: CGImage? {
+        didSet { coverGrid = nil }
+    }
+    var coverResolution = 40 {          // dots across the cover
+        didSet { if coverResolution != oldValue { coverGrid = nil } }
+    }
+    private var coverGrid: CoverPixels?
+    var coverMotion = true                       // true: dots dance around; false: dots only grow
+    private var coverClock: CGFloat = 0          // drives the dots' movement; runs faster on busy music
+    private var lastCoverTime: CFTimeInterval = 0
+    private var coverMix: CGFloat = 0    // 0 = grey (silent), 1 = full colour (playing)
+
+    /// True while the cover is still fading between grey and colour, so it needs redrawing.
+    var isAnimating: Bool {
+        style == .cover && abs((active ? 1 : 0) - coverMix) > 0.01
+    }
+
     // Orb: dots spread evenly over a sphere, drawn in three depth layers (far, middle, near).
     private let orbLayers = [CAShapeLayer(), CAShapeLayer(), CAShapeLayer()]
     private var orbAngle: CGFloat = 0
@@ -730,8 +778,12 @@ final class VisualizerView: NSView {
         }
         gradient.mask = waveMask
 
+        coverLayer.isHidden = true
+        coverLayer.contentsGravity = .resize
+
         layer?.addSublayer(backdrop)
         layer?.addSublayer(gradient)
+        layer?.addSublayer(coverLayer)
     }
 
     required init?(coder: NSCoder) {
@@ -773,6 +825,10 @@ final class VisualizerView: NSView {
         CATransaction.setAnimationDuration(duration)
         gradient.colors = active ? (palette ?? VisualizerView.defaultColors) : VisualizerView.restingColors
         let orb = style == .orb
+        let showCover = style == .cover
+        gradient.isHidden = showCover
+        coverLayer.isHidden = !showCover
+        if !showCover { coverLayer.contents = nil }
         fillLayer.isHidden = orb
         lineLayer.isHidden = orb
         for orbLayer in orbLayers {
@@ -846,6 +902,10 @@ final class VisualizerView: NSView {
             drawOrb(soft, width: w, height: h, baseY: baseY)
             return
         }
+        if style == .cover {
+            drawCover(soft, width: w, height: h, baseY: baseY)
+            return
+        }
 
         // Symmetrical: bass in the middle of the Dock, treble out to both ends.
         // Left to right: bass at the left end, treble at the right.
@@ -901,6 +961,99 @@ final class VisualizerView: NSView {
         gradient.endPoint = CGPoint(x: (left + waveWidth) / w, y: 0.5)
         lineLayer.path = line
         fillLayer.path = fill
+        CATransaction.commit()
+    }
+
+    /// The album cover rebuilt from a grid of dots. Each dot keeps the cover's colour at that spot
+    /// and dances around its home position with its slice of the sound.
+    /// Silent: still grey dots. Playing: fades into full colour.
+    private func drawCover(_ soft: [CGFloat], width w: CGFloat, height h: CGFloat, baseY: CGFloat) {
+        let n = soft.count
+        coverMix += ((active ? 1 : 0) - coverMix) * 0.08
+
+        let now = CACurrentMediaTime()
+        let dt = CGFloat(min(max(now - lastCoverTime, 0), 0.05))
+        lastCoverTime = now
+
+        var energy: CGFloat = 0
+        for value in soft { energy += value }
+        energy /= CGFloat(n)
+        let bassCount = min(6, n)
+        var bass: CGFloat = 0
+        for i in 0..<bassCount { bass += soft[i] }
+        bass /= CGFloat(bassCount)
+        coverClock += dt * (1 + energy * 3)
+
+        if coverGrid == nil, let image = coverImage {
+            coverGrid = AlbumColorWatcher.coverPixels(from: image, side: coverResolution)
+        }
+        let cover = coverGrid
+        let grid = cover?.side ?? coverResolution
+
+        let side = (min(w, h - baseY) * 0.42 * shapeScale).rounded()
+        let cell = side / CGFloat(grid)
+        let room = (side * 1.3 + cell * 6).rounded()   // space for dots that wander outside the cover
+        let scale = window?.backingScaleFactor ?? 2
+        let pixels = Int(room * scale)
+        guard pixels > 0,
+              let ctx = CGContext(data: nil, width: pixels, height: pixels, bitsPerComponent: 8,
+                                  bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return }
+        ctx.scaleBy(x: scale, y: scale)
+
+        let half = CGFloat(grid) / 2
+        let centre = room / 2
+        let push = 1 + bass * 0.10 * heightScale
+        let farthest = half * CGFloat(2).squareRoot()
+        let alpha = 0.45 + 0.55 * coverMix
+        let clock = coverClock
+
+        for gy in 0..<grid {
+            for gx in 0..<grid {
+                let dx = CGFloat(gx) + 0.5 - half
+                let dy = half - (CGFloat(gy) + 0.5)
+                let distance = (dx * dx + dy * dy).squareRoot()
+
+                // Symmetrical: bass in the centre of the cover, treble at the corners.
+                // Left to right: bass on the left edge, treble on the right.
+                let t = mirrored ? distance / farthest : (CGFloat(gx) + 0.5) / CGFloat(grid)
+                let band = min(Int(t * CGFloat(n - 1)), n - 1)
+                let level = soft[band]
+
+                var r: CGFloat = 0.6, g: CGFloat = 0.6, b: CGFloat = 0.6
+                if let cover = cover {
+                    let c = cover.colors[gy * grid + gx]
+                    r = c.r; g = c.g; b = c.b
+                }
+                let grey = 0.3 * r + 0.59 * g + 0.11 * b
+                r = grey + (r - grey) * coverMix
+                g = grey + (g - grey) * coverMix
+                b = grey + (b - grey) * coverMix
+
+                // Every dot gets its own rhythm so they don't all move in step.
+                let seed = sin(CGFloat(gx) * 12.9898 + CGFloat(gy) * 78.233) * 43758.5453
+                let phase = (seed - seed.rounded(.down)) * 2 * .pi
+                let wander = coverMotion ? cell * 0.95 * level * heightScale : 0
+                let ox = sin(clock * 2.3 + phase) * wander
+                let oy = cos(clock * 1.9 + phase * 1.37) * wander
+
+                // Moving: dots grow a little. Still: dots do all the reacting by growing (the original look).
+                let radius = coverMotion
+                    ? cell * 0.5 * min(0.5 + level * 0.3 * heightScale, 0.95)
+                    : cell * 0.5 * min(0.42 + level * 0.65 * heightScale, 1.15)
+                let x = centre + dx * cell * push + ox
+                let y = centre + dy * cell * push + oy
+                ctx.setFillColor(red: r, green: g, blue: b, alpha: alpha)
+                ctx.fillEllipse(in: CGRect(x: x - radius, y: y - radius, width: radius * 2, height: radius * 2))
+            }
+        }
+
+        guard let image = ctx.makeImage() else { return }
+        let cy = baseY + (h - baseY) / 2
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        coverLayer.frame = CGRect(x: (w - room) / 2, y: cy - room / 2, width: room, height: room)
+        coverLayer.contents = image
         CATransaction.commit()
     }
 
@@ -1024,6 +1177,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var idle = false
     private let albumWatcher = AlbumColorWatcher()
     private var albumColors: [CGColor]?
+    private var albumCover: CGImage?
+    private let resolutionKey = "coverResolution"
+    private let motionKey = "coverMotion"
+
+    private var coverMotion: Bool {
+        (UserDefaults.standard.object(forKey: motionKey) as? Bool) ?? true
+    }
+
+    private var coverResolution: Int {
+        let stored = UserDefaults.standard.integer(forKey: resolutionKey)
+        return stored > 0 ? stored : 40
+    }
     private var dockWidth = estimatedDockWidth()
     private var frame = 0
     private var active = false
@@ -1119,6 +1284,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             view.style = style
             view.monstercatSmoothing = UserDefaults.standard.bool(forKey: smoothingKey)
             view.setColors(albumColors)
+            view.coverResolution = coverResolution
+            view.coverMotion = coverMotion
+            view.coverImage = albumCover
             view.setActive(active)
             window.contentView = view
             window.setFrame(screen.frame, display: true)
@@ -1161,7 +1329,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let update = albumWatcher.takeUpdate()
         if update.changed {
             albumColors = update.colors
-            views.forEach { $0.setColors(update.colors) }
+            albumCover = update.cover
+            views.forEach {
+                $0.setColors(update.colors)
+                $0.coverImage = update.cover
+            }
+            idle = false
         }
 
         let target = analyzer.snapshot()
@@ -1185,7 +1358,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Nothing playing: draw the resting state once, then stop touching the layers.
         if peak < 0.003 {
-            if idle && style != .orb { return }     // the orb keeps spinning in silence
+            // The orb keeps spinning in silence; the cover redraws until its fade has finished.
+            if idle && style != .orb && !views.contains(where: { $0.isAnimating }) { return }
             idle = true
         } else {
             // Check the album cover when sound starts, then every few seconds while it plays.
@@ -1263,6 +1437,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(shapeParent)
         styleItems.append(shapeParent)
 
+        let coverItem = NSMenuItem(title: "Album Cover", action: #selector(chooseStyle(_:)), keyEquivalent: "")
+        coverItem.target = self
+        coverItem.tag = WaveStyle.cover.rawValue
+        coverItem.state = style == .cover ? .on : .off
+        menu.addItem(coverItem)
+        styleItems.append(coverItem)
+
+        let motionItem = NSMenuItem(title: "Moving Cover Dots", action: #selector(toggleCoverMotion(_:)),
+                                    keyEquivalent: "")
+        motionItem.target = self
+        motionItem.state = coverMotion ? .on : .off
+        motionItem.indentationLevel = 1
+        menu.addItem(motionItem)
+
         // How many small copies orbit the 3D shape.
         let orbitParent = NSMenuItem(title: "Orbiting Shapes", action: nil, keyEquivalent: "")
         let orbitMenu = NSMenu()
@@ -1319,7 +1507,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         sliderItem.view = sliderBox
         menu.addItem(sliderItem)
 
-        let sizeLabel = NSMenuItem(title: "3D Shape Size", action: nil, keyEquivalent: "")
+        let sizeLabel = NSMenuItem(title: "Shape & Cover Size", action: nil, keyEquivalent: "")
         sizeLabel.isEnabled = false
         menu.addItem(sizeLabel)
 
@@ -1332,6 +1520,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let sizeItem = NSMenuItem()
         sizeItem.view = sizeBox
         menu.addItem(sizeItem)
+
+        let resolutionLabel = NSMenuItem(title: "Cover Resolution", action: nil, keyEquivalent: "")
+        resolutionLabel.isEnabled = false
+        menu.addItem(resolutionLabel)
+
+        let resolutionSlider = NSSlider(value: Double(coverResolution), minValue: 10, maxValue: 96,
+                                        target: self, action: #selector(resolutionChanged(_:)))
+        resolutionSlider.isContinuous = true
+        resolutionSlider.frame = NSRect(x: 18, y: 4, width: 204, height: 22)
+        let resolutionBox = NSView(frame: NSRect(x: 0, y: 0, width: 240, height: 30))
+        resolutionBox.addSubview(resolutionSlider)
+        let resolutionItem = NSMenuItem()
+        resolutionItem.view = resolutionBox
+        menu.addItem(resolutionItem)
         menu.addItem(.separator())
 
         let login = NSMenuItem(title: "Open at Login", action: #selector(toggleLogin(_:)), keyEquivalent: "")
@@ -1410,6 +1612,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         UserDefaults.standard.set(count, forKey: orbitKey)
         orbitItems.forEach { $0.state = $0.tag == count ? .on : .off }
         views.forEach { $0.orbitCount = count }
+        idle = false
+    }
+
+    @objc private func toggleCoverMotion(_ sender: NSMenuItem) {
+        let on = sender.state != .on
+        sender.state = on ? .on : .off
+        UserDefaults.standard.set(on, forKey: motionKey)
+        views.forEach { $0.coverMotion = on }
+        idle = false
+    }
+
+    @objc private func resolutionChanged(_ sender: NSSlider) {
+        let value = Int(sender.doubleValue.rounded())
+        guard value != coverResolution || views.first?.coverResolution != value else { return }
+        UserDefaults.standard.set(value, forKey: resolutionKey)
+        views.forEach { $0.coverResolution = value }
         idle = false
     }
 
