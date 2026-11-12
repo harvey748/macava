@@ -1,0 +1,1109 @@
+// AudioWallpaper — a live audio visualiser that sits on the desktop, behind your icons.
+// Listens to whatever the Mac is playing (system output) via ScreenCaptureKit.
+// Build with ./build.sh (needs Xcode Command Line Tools). Requires macOS 13+.
+
+import Cocoa
+import ScreenCaptureKit
+import Accelerate
+import CoreMedia
+import CoreAudio
+import ServiceManagement
+
+// MARK: - Spectrum analysis
+
+/// Collects incoming audio, runs an FFT and exposes log-spaced band levels (0...1).
+final class SpectrumAnalyzer: @unchecked Sendable {
+    static let bandCount = 48
+
+    private let n = 2048
+    private let hop = 512
+    private let dft: vDSP_DFT_Setup
+    private var window: [Float]
+    private let zeros: [Float]
+    private var ring: [Float]
+    private var writeIndex = 0
+    private var pending = 0
+    private var sampleRate: Double = 48_000
+
+    private let lock = NSLock()
+    private var levels = [Float](repeating: 0, count: SpectrumAnalyzer.bandCount)
+    private var lastUpdate = Date.distantPast
+
+    init() {
+        dft = vDSP_DFT_zop_CreateSetup(nil, vDSP_Length(n), .FORWARD)!
+        window = [Float](repeating: 0, count: n)
+        vDSP_hann_window(&window, vDSP_Length(n), Int32(vDSP_HANN_DENORM))
+        zeros = [Float](repeating: 0, count: n)
+        ring = [Float](repeating: 0, count: n)
+    }
+
+    /// Called on the audio queue only.
+    func append(_ samples: [Float], sampleRate: Double) {
+        self.sampleRate = sampleRate
+        for s in samples {
+            ring[writeIndex] = s
+            writeIndex = (writeIndex + 1) % n
+        }
+        pending += samples.count
+        if pending >= hop {
+            pending = 0
+            analyze()
+        }
+    }
+
+    /// Latest band levels; all zeros if no audio has arrived recently.
+    func snapshot() -> [Float] {
+        lock.lock()
+        defer { lock.unlock() }
+        if Date().timeIntervalSince(lastUpdate) > 0.3 {
+            return [Float](repeating: 0, count: SpectrumAnalyzer.bandCount)
+        }
+        return levels
+    }
+
+    private func analyze() {
+        // Unroll the ring buffer (oldest sample first) and apply the window.
+        var frame = [Float](repeating: 0, count: n)
+        for i in 0..<n {
+            frame[i] = ring[(writeIndex + i) % n] * window[i]
+        }
+
+        var re = [Float](repeating: 0, count: n)
+        var im = [Float](repeating: 0, count: n)
+        vDSP_DFT_Execute(dft, frame, zeros, &re, &im)
+
+        let half = n / 2
+        var mags = [Float](repeating: 0, count: half)
+        for i in 0..<half {
+            mags[i] = (re[i] * re[i] + im[i] * im[i]).squareRoot()
+        }
+
+        let bands = SpectrumAnalyzer.bandCount
+        let fMin = 50.0, fMax = 16_000.0
+        let binWidth = sampleRate / Double(n)
+        let fullScale = Float(n) / 4          // magnitude of a full-scale sine after a Hann window
+        var out = [Float](repeating: 0, count: bands)
+
+        for b in 0..<bands {
+            let f0 = fMin * pow(fMax / fMin, Double(b) / Double(bands))
+            let f1 = fMin * pow(fMax / fMin, Double(b + 1) / Double(bands))
+            let x0 = f0 / binWidth
+            let x1 = f1 / binWidth
+            var mag: Float = 0
+
+            if x1 - x0 < 1.5 {
+                // Band narrower than a bin: interpolate so neighbouring bars don't come out identical.
+                let c = (x0 + x1) / 2
+                let i = min(max(Int(c), 1), half - 2)
+                let t = Float(c - Double(i))
+                mag = mags[i] * (1 - t) + mags[i + 1] * t
+            } else {
+                let lo = min(max(Int(x0), 1), half - 1)
+                let hi = min(max(Int(x1), lo), half - 1)
+                for i in lo...hi { mag = max(mag, mags[i]) }
+            }
+
+            var db = 20 * log10(max(mag / fullScale, 1e-7))
+            db += 14 * Float(b) / Float(bands - 1)        // lift the treble, which is naturally quieter
+            out[b] = min(max((db + 65) / 55, 0), 1)       // -65 dB ... -10 dB  ->  0 ... 1
+        }
+
+        lock.lock()
+        levels = out
+        lastUpdate = Date()
+        lock.unlock()
+    }
+}
+
+// MARK: - System audio capture
+
+final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
+    let analyzer: SpectrumAnalyzer
+    private var stream: SCStream?
+    private let queue = DispatchQueue(label: "audiowallpaper.capture")
+
+    init(analyzer: SpectrumAnalyzer) {
+        self.analyzer = analyzer
+    }
+
+    func start() async throws {
+        let content = try await SCShareableContent.current
+        guard let display = content.displays.first else {
+            throw NSError(domain: "AudioWallpaper", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "No display found"])
+        }
+
+        let filter = SCContentFilter(display: display, excludingWindows: [])
+        let config = SCStreamConfiguration()
+        config.capturesAudio = true
+        config.excludesCurrentProcessAudio = true
+        config.sampleRate = 48_000
+        config.channelCount = 2
+        // We only want sound; keep the video side as cheap as possible.
+        config.width = 2
+        config.height = 2
+        config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
+        config.showsCursor = false
+
+        let stream = SCStream(filter: filter, configuration: config, delegate: self)
+        try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: queue)
+        try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
+        try await stream.startCapture()
+        self.stream = stream
+    }
+
+    func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
+                of type: SCStreamOutputType) {
+        guard type == .audio, sampleBuffer.isValid else { return }
+
+        var rate = 48_000.0
+        if let desc = CMSampleBufferGetFormatDescription(sampleBuffer),
+           let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(desc) {
+            rate = asbd.pointee.mSampleRate
+        }
+
+        var mono: [Float] = []
+        try? sampleBuffer.withAudioBufferList { buffers, _ in
+            guard let first = buffers.first, first.mData != nil else { return }
+            let floatSize = MemoryLayout<Float>.size
+
+            if buffers.count > 1 {
+                // One buffer per channel (planar).
+                let frames = Int(first.mDataByteSize) / floatSize
+                mono = [Float](repeating: 0, count: frames)
+                for buffer in buffers {
+                    guard let data = buffer.mData else { continue }
+                    let p = data.assumingMemoryBound(to: Float.self)
+                    let count = min(frames, Int(buffer.mDataByteSize) / floatSize)
+                    for i in 0..<count { mono[i] += p[i] }
+                }
+                let scale = 1 / Float(buffers.count)
+                for i in 0..<frames { mono[i] *= scale }
+            } else {
+                // Single buffer, possibly interleaved.
+                let channels = max(Int(first.mNumberChannels), 1)
+                let frames = Int(first.mDataByteSize) / (floatSize * channels)
+                let p = first.mData!.assumingMemoryBound(to: Float.self)
+                mono = [Float](repeating: 0, count: frames)
+                for i in 0..<frames {
+                    var sum: Float = 0
+                    for c in 0..<channels { sum += p[i * channels + c] }
+                    mono[i] = sum / Float(channels)
+                }
+            }
+        }
+
+        if !mono.isEmpty {
+            analyzer.append(mono, sampleRate: rate)
+        }
+    }
+
+    func stream(_ stream: SCStream, didStopWithError error: Error) {
+        // Capture can stop on sleep, display changes, etc. Keep trying to bring it back.
+        self.stream = nil
+        Task { [weak self] in
+            while let self = self {
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                do {
+                    try await self.start()
+                    return
+                } catch {
+                    continue
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Album colours (system Now Playing)
+
+/// Asks macOS what is playing and turns the album cover into a small colour palette.
+/// macOS only answers Now Playing queries from Apple's own tools, so the question is asked through osascript.
+final class AlbumColorWatcher: @unchecked Sendable {
+    private let queue = DispatchQueue(label: "audiowallpaper.nowplaying")
+    private let lock = NSLock()
+    private var lastKey = ""                 // track whose cover has already been used
+    private var busy = false
+    private var hasUpdate = false
+    private var pending: [CGColor]?
+
+    private let script = """
+    function run(argv) {
+      try {
+        ObjC.import('Foundation');
+        const bundle = $.NSBundle.bundleWithPath('/System/Library/PrivateFrameworks/MediaRemote.framework/');
+        bundle.load;
+        const Request = $.NSClassFromString('MRNowPlayingRequest');
+        const item = Request.localNowPlayingItem;
+        if (!item || item.isNil()) return '';
+        const info = item.nowPlayingInfo;
+        if (!info || info.isNil()) return '';
+        const text = function (k) {
+          const v = info.valueForKey(k);
+          return (v && !v.isNil()) ? ObjC.unwrap(v.description) : '';
+        };
+        const key = (text('kMRMediaRemoteNowPlayingInfoTitle') + ' / ' +
+                     text('kMRMediaRemoteNowPlayingInfoArtist') + ' / ' +
+                     text('kMRMediaRemoteNowPlayingInfoAlbum')).replace(/\\n/g, ' ');
+        if (key === argv[0]) return key;
+        const art = info.valueForKey('kMRMediaRemoteNowPlayingInfoArtworkData');
+        if (!art || art.isNil()) return key;
+        return key + '\\n' + ObjC.unwrap(art.base64EncodedStringWithOptions(0));
+      } catch (e) {
+        return '';
+      }
+    }
+    """
+
+    private let spotifyScript = """
+    tell application "Spotify"
+      if player state is playing then
+        return (id of current track) & linefeed & (artwork url of current track)
+      end if
+    end tell
+    return ""
+    """
+
+    private let musicScript = """
+    on run argv
+      set lastKey to item 1 of argv
+      set artPath to item 2 of argv
+      set k to ""
+      set d to missing value
+      tell application "Music"
+        if player state is not playing then return ""
+        set t to current track
+        set k to (name of t) & " / " & (artist of t) & " / " & (album of t)
+        if k is lastKey then return k
+        try
+          set d to raw data of artwork 1 of t
+        end try
+      end tell
+      if d is missing value then return k
+      try
+        set f to open for access (POSIX file artPath) with write permission
+        set eof f to 0
+        write d to f
+        close access f
+        return k & linefeed & "ART"
+      end try
+      return k
+    end run
+    """
+
+    private func runScript(_ source: String, language: String? = nil, arguments: [String] = []) -> [String] {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        var args: [String] = []
+        if let language = language { args += ["-l", language] }
+        args += ["-e", source]
+        args += arguments
+        process.arguments = args
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        do { try process.run() } catch { return [] }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        let output = String(data: data, encoding: .utf8) ?? ""
+        return output.split(separator: "\n", omittingEmptySubsequences: true).map { String($0) }
+    }
+
+    private func isRunning(_ bundleID: String) -> Bool {
+        !NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).isEmpty
+    }
+
+    /// Kick off a check in the background. Safe to call often.
+    func poll() {
+        lock.lock()
+        if busy { lock.unlock(); return }
+        busy = true
+        lock.unlock()
+        queue.async {
+            self.fetch()
+            self.lock.lock()
+            self.busy = false
+            self.lock.unlock()
+        }
+    }
+
+    /// Returns new colours once after each change. `colors == nil` means "back to the default look".
+    func takeUpdate() -> (changed: Bool, colors: [CGColor]?) {
+        lock.lock()
+        defer { lock.unlock() }
+        if !hasUpdate { return (false, nil) }
+        hasUpdate = false
+        return (true, pending)
+    }
+
+    private func publish(_ colors: [CGColor]?) {
+        lock.lock()
+        pending = colors
+        hasUpdate = true
+        lock.unlock()
+    }
+
+    private func fetch() {
+        // 1. Spotify: it hands out a web address for the cover.
+        if isRunning("com.spotify.client") {
+            let lines = runScript(spotifyScript)
+            if lines.count >= 2 {
+                let key = lines[0]
+                if key == lastKey { return }
+                if let url = URL(string: lines[1]),
+                   let art = try? Data(contentsOf: url),
+                   let colors = AlbumColorWatcher.palette(from: art) {
+                    lastKey = key
+                    publish(colors)
+                }
+                return
+            }
+        }
+
+        // 2. Apple Music: it writes the cover to a temporary file for us.
+        if isRunning("com.apple.Music") {
+            let artPath = NSTemporaryDirectory() + "audiowallpaper-art"
+            let lines = runScript(musicScript, arguments: [lastKey, artPath])
+            if let key = lines.first, !key.isEmpty {
+                if key == lastKey { return }
+                if lines.count >= 2,
+                   let art = try? Data(contentsOf: URL(fileURLWithPath: artPath)),
+                   let colors = AlbumColorWatcher.palette(from: art) {
+                    publish(colors)
+                } else {
+                    publish(nil)
+                }
+                lastKey = key
+                return
+            }
+        }
+
+        // 3. Anything else: the system's Now Playing info, when macOS lets us see it.
+        let lines = runScript(script, language: "JavaScript", arguments: [lastKey])
+        guard let key = lines.first, !key.isEmpty else {
+            if !lastKey.isEmpty {
+                lastKey = ""
+                publish(nil)
+            }
+            return
+        }
+        if lines.count >= 2,
+           let art = Data(base64Encoded: lines[lines.count - 1], options: .ignoreUnknownCharacters),
+           let colors = AlbumColorWatcher.palette(from: art) {
+            lastKey = key
+            publish(colors)
+        }
+    }
+
+    private static func hsb(_ r: CGFloat, _ g: CGFloat, _ b: CGFloat) -> (h: CGFloat, s: CGFloat, v: CGFloat) {
+        let mx = max(r, g, b), mn = min(r, g, b)
+        let d = mx - mn
+        var h: CGFloat = 0
+        if d > 0 {
+            if mx == r {
+                h = ((g - b) / d).truncatingRemainder(dividingBy: 6)
+            } else if mx == g {
+                h = (b - r) / d + 2
+            } else {
+                h = (r - g) / d + 4
+            }
+            h /= 6
+            if h < 0 { h += 1 }
+        }
+        return (h, mx == 0 ? 0 : d / mx, mx)
+    }
+
+    /// Picks the most prominent vivid colours from the cover, brightened enough to show on a desktop.
+    static func palette(from data: Data) -> [CGColor]? {
+        guard let image = NSImage(data: data),
+              let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
+
+        let side = 32
+        guard let ctx = CGContext(data: nil, width: side, height: side, bitsPerComponent: 8,
+                                  bytesPerRow: side * 4, space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        ctx.interpolationQuality = .medium
+        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: side, height: side))
+        guard let raw = ctx.data else { return nil }
+        let px = raw.bindMemory(to: UInt8.self, capacity: side * side * 4)
+
+        let bucketCount = 12
+        var weight = [CGFloat](repeating: 0, count: bucketCount)
+        var sumR = [CGFloat](repeating: 0, count: bucketCount)
+        var sumG = [CGFloat](repeating: 0, count: bucketCount)
+        var sumB = [CGFloat](repeating: 0, count: bucketCount)
+        var total: CGFloat = 0
+
+        for i in 0..<(side * side) {
+            let r = CGFloat(px[i * 4]) / 255
+            let g = CGFloat(px[i * 4 + 1]) / 255
+            let b = CGFloat(px[i * 4 + 2]) / 255
+            let c = hsb(r, g, b)
+            if c.s < 0.18 || c.v < 0.18 { continue }
+            let w = c.s * c.s * c.v
+            let bucket = min(Int(c.h * CGFloat(bucketCount)), bucketCount - 1)
+            weight[bucket] += w
+            sumR[bucket] += r * w
+            sumG[bucket] += g * w
+            sumB[bucket] += b * w
+            total += w
+        }
+
+        // Black-and-white or washed-out cover: use a clean white wave.
+        if total < 12 {
+            let white = NSColor(calibratedWhite: 0.97, alpha: 1).cgColor
+            let grey = NSColor(calibratedWhite: 0.72, alpha: 1).cgColor
+            return [grey, white, grey]
+        }
+
+        let order = (0..<bucketCount).sorted { weight[$0] > weight[$1] }
+        let top = weight[order[0]]
+        var picked: [CGColor] = []
+        for bucket in order.prefix(3) where weight[bucket] >= top * 0.15 {
+            let w = weight[bucket]
+            let c = hsb(sumR[bucket] / w, sumG[bucket] / w, sumB[bucket] / w)
+            picked.append(NSColor(calibratedHue: c.h, saturation: max(c.s, 0.55),
+                                  brightness: max(c.v, 0.90), alpha: 1).cgColor)
+        }
+
+        // Arrange symmetrically, main colour in the middle, to match the mirrored wave.
+        switch picked.count {
+        case 3: return [picked[2], picked[1], picked[0], picked[1], picked[2]]
+        case 2: return [picked[1], picked[0], picked[1]]
+        default:
+            let main = picked[0]
+            let soft = main.copy(alpha: 0.55) ?? main
+            return [soft, main, soft]
+        }
+    }
+}
+
+// MARK: - System volume
+
+/// Current output volume of the Mac, 0...1 (0 when muted). Returns 1 for outputs with no volume control.
+func systemOutputVolume() -> Float {
+    var device = AudioDeviceID(0)
+    var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+    var deviceAddress = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+                                                   mScope: kAudioObjectPropertyScopeGlobal, mElement: 0)
+    guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &deviceAddress,
+                                     0, nil, &size, &device) == noErr else { return 1 }
+
+    var muted: UInt32 = 0
+    size = UInt32(MemoryLayout<UInt32>.size)
+    var muteAddress = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyMute,
+                                                 mScope: kAudioObjectPropertyScopeOutput, mElement: 0)
+    if AudioObjectHasProperty(device, &muteAddress),
+       AudioObjectGetPropertyData(device, &muteAddress, 0, nil, &size, &muted) == noErr,
+       muted != 0 {
+        return 0
+    }
+
+    var volume: Float32 = 1
+    size = UInt32(MemoryLayout<Float32>.size)
+    // 'vmvc' = the device's overall ("virtual main") volume, the one the volume keys change.
+    var volumeAddress = AudioObjectPropertyAddress(mSelector: AudioObjectPropertySelector(0x766D_7663),
+                                                   mScope: kAudioObjectPropertyScopeOutput, mElement: 0)
+    guard AudioObjectHasProperty(device, &volumeAddress),
+          AudioObjectGetPropertyData(device, &volumeAddress, 0, nil, &size, &volume) == noErr else { return 1 }
+    return min(max(volume, 0), 1)
+}
+
+// MARK: - Dock geometry
+
+/// Rough width of the Dock, worked out from its settings (macOS doesn't tell apps the real size).
+func estimatedDockWidth() -> CGFloat {
+    let dock = UserDefaults(suiteName: "com.apple.dock")
+    let tile = CGFloat((dock?.object(forKey: "tilesize") as? Double) ?? 48)
+    let pinnedApps = dock?.array(forKey: "persistent-apps") ?? []
+    let pinnedOthers = dock?.array(forKey: "persistent-others")?.count ?? 1
+
+    var pinnedIDs = Set<String>()
+    for entry in pinnedApps {
+        if let dict = entry as? [String: Any],
+           let tileData = dict["tile-data"] as? [String: Any],
+           let id = tileData["bundle-identifier"] as? String {
+            pinnedIDs.insert(id)
+        }
+    }
+    let runningUnpinned = NSWorkspace.shared.runningApplications.filter {
+        $0.activationPolicy == .regular
+            && $0.bundleIdentifier != "com.apple.finder"
+            && !pinnedIDs.contains($0.bundleIdentifier ?? "")
+    }.count
+    let showRecents = (dock?.object(forKey: "show-recents") as? Bool) ?? true
+    let recents = showRecents ? min(dock?.array(forKey: "recent-apps")?.count ?? 0, 3) : 0
+
+    let count = pinnedApps.count + pinnedOthers + max(runningUnpinned, recents) + 2   // + Finder and Bin
+    return CGFloat(count) * tile * 1.1 + 40
+}
+
+// MARK: - Drawing
+
+final class VisualizerView: NSView {
+    private let backdrop = CALayer()
+    private let gradient = CAGradientLayer()
+    private let waveMask = CALayer()
+    private let fillLayer = CAShapeLayer()
+    private let lineLayer = CAShapeLayer()
+
+    static let defaultColors: [CGColor] = [
+        NSColor(calibratedRed: 1.00, green: 0.55, blue: 0.35, alpha: 1).cgColor,
+        NSColor(calibratedRed: 0.95, green: 0.35, blue: 0.85, alpha: 1).cgColor,
+        NSColor(calibratedRed: 0.30, green: 0.75, blue: 1.00, alpha: 1).cgColor,
+        NSColor(calibratedRed: 0.95, green: 0.35, blue: 0.85, alpha: 1).cgColor,
+        NSColor(calibratedRed: 1.00, green: 0.55, blue: 0.35, alpha: 1).cgColor
+    ]
+
+    /// Shown while nothing is playing: a plain, colourless hairline.
+    static let restingColors: [CGColor] = [
+        NSColor(calibratedWhite: 1, alpha: 0.55).cgColor,
+        NSColor(calibratedWhite: 1, alpha: 0.55).cgColor
+    ]
+
+    var dockWidth: CGFloat = 700
+    var widthScale: CGFloat = 1          // fine-tuning from the menu bar slider
+    var heightScale: CGFloat = 1         // follows the Mac's volume
+    var mirrored = true                  // true: bass in the middle; false: bass left, treble right
+    var bars = false {                   // true: solid bars instead of a wave
+        didSet { applyAppearance(duration: 0.3) }
+    }
+    var monstercatSmoothing = false      // loud bands lift their neighbours into rounded hills
+    private var palette: [CGColor]?
+    private var active = false
+
+    var dimmed = false {
+        didSet {
+            backdrop.backgroundColor = NSColor.black.withAlphaComponent(dimmed ? 0.45 : 0).cgColor
+        }
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+
+        gradient.colors = VisualizerView.restingColors
+        gradient.startPoint = CGPoint(x: 0, y: 0.5)
+        gradient.endPoint = CGPoint(x: 1, y: 0.5)
+
+        // The mask's opacity decides how strongly the gradient shows:
+        // a soft translucent body with a bright crest line on top.
+        fillLayer.fillColor = NSColor.white.withAlphaComponent(0.40).cgColor
+        lineLayer.fillColor = nil
+        lineLayer.strokeColor = NSColor.white.cgColor
+        lineLayer.lineWidth = 1.5
+        fillLayer.opacity = 0
+        lineLayer.lineJoin = .round
+        lineLayer.lineCap = .round
+        waveMask.addSublayer(fillLayer)
+        waveMask.addSublayer(lineLayer)
+        gradient.mask = waveMask
+
+        layer?.addSublayer(backdrop)
+        layer?.addSublayer(gradient)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) is not supported")
+    }
+
+    override func layout() {
+        super.layout()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        backdrop.frame = bounds
+        gradient.frame = bounds
+        waveMask.frame = bounds
+        fillLayer.frame = bounds
+        lineLayer.frame = bounds
+        CATransaction.commit()
+    }
+
+    /// Remember a new palette (nil = default colours) and fade to it if sound is playing.
+    func setColors(_ colors: [CGColor]?) {
+        palette = colors
+        guard active else { return }
+        CATransaction.begin()
+        CATransaction.setAnimationDuration(1.2)
+        gradient.colors = colors ?? VisualizerView.defaultColors
+        CATransaction.commit()
+    }
+
+    /// Playing: coloured. Silent: colourless (a thin line for the wave, a row of low dashes for bars).
+    func setActive(_ nowActive: Bool) {
+        guard nowActive != active else { return }
+        active = nowActive
+        applyAppearance(duration: nowActive ? 0.35 : 0.9)
+    }
+
+    private func applyAppearance(duration: CFTimeInterval) {
+        CATransaction.begin()
+        CATransaction.setAnimationDuration(duration)
+        gradient.colors = active ? (palette ?? VisualizerView.defaultColors) : VisualizerView.restingColors
+        if bars {
+            fillLayer.fillColor = NSColor.white.cgColor
+            fillLayer.opacity = 1
+            lineLayer.opacity = 0
+        } else {
+            fillLayer.fillColor = NSColor.white.withAlphaComponent(0.40).cgColor
+            fillLayer.opacity = active ? 1 : 0
+            lineLayer.opacity = 1
+            lineLayer.lineWidth = active ? 3 : 1.5
+        }
+        CATransaction.commit()
+    }
+
+    func update(levels: [Float]) {
+        let w = bounds.width
+        let h = bounds.height
+        let n = levels.count
+        guard w > 0, h > 0, n > 2 else { return }
+
+        // Where is the Dock on this screen?
+        var baseY: CGFloat = 0
+        var waveWidth = min(dockWidth * widthScale, w)
+        if let screen = window?.screen {
+            let f = screen.frame, v = screen.visibleFrame
+            let dockOnSide = v.minX > f.minX + 1 || v.maxX < f.maxX - 1
+            if dockOnSide {
+                waveWidth = w                       // no Dock along the bottom: use the whole edge
+            } else {
+                baseY = max(v.minY - f.minY - 1, 0) // top edge of the Dock (0 if it is hidden)
+            }
+        }
+        let left = (w - waveWidth) / 2
+        let maxHeight = h * 0.40 * heightScale
+
+        // Soften neighbouring bands so the outline reads as one wave.
+        var soft = [CGFloat](repeating: 0, count: n)
+        for i in 0..<n {
+            let a = CGFloat(levels[max(i - 1, 0)])
+            let b = CGFloat(levels[i])
+            let c = CGFloat(levels[min(i + 1, n - 1)])
+            let mixed = 0.15 * a + 0.7 * b + 0.15 * c
+            // Exaggerate the difference between loud and quiet so peaks punch upwards.
+            soft[i] = min(pow(mixed, 1.7) * 1.2, 1.1)
+        }
+
+        // The very lowest bands are often empty; stop them carving a notch in the middle.
+        soft[1] = max(soft[1], soft[2])
+        soft[0] = max(soft[0], soft[1])
+
+        // Monstercat smoothing: every loud band props up its neighbours, giving smooth "hills".
+        if monstercatSmoothing {
+            for i in 0..<n {
+                var falloff: CGFloat = 1
+                for d in 1..<n {
+                    falloff *= 1.5
+                    let spread = soft[i] / falloff
+                    if spread < 0.01 { break }
+                    if i - d >= 0 { soft[i - d] = max(soft[i - d], spread) }
+                    if i + d < n { soft[i + d] = max(soft[i + d], spread) }
+                }
+            }
+        }
+
+        // Symmetrical: bass in the middle of the Dock, treble out to both ends.
+        // Left to right: bass at the left end, treble at the right.
+        let total = mirrored ? 2 * n - 1 : n
+        let line = CGMutablePath()
+        let fill = CGMutablePath()
+
+        if bars {
+            // Flat-topped bars standing on the Dock.
+            let slot = waveWidth / CGFloat(total)
+            let barWidth = max(slot * 0.68, 1)
+            for j in 0..<total {
+                let band = mirrored ? abs(j - (n - 1)) : j
+                let barHeight = max(soft[band] * maxHeight, 2)
+                let x = left + CGFloat(j) * slot + (slot - barWidth) / 2
+                fill.addRect(CGRect(x: x, y: baseY, width: barWidth, height: barHeight))
+            }
+        } else {
+            // One smooth wave, easing down to nothing at the Dock's corners.
+            let taperSpan: CGFloat = mirrored ? 0.12 : 0.05
+            var points: [CGPoint] = []
+            points.reserveCapacity(total)
+            for j in 0..<total {
+                let band = mirrored ? abs(j - (n - 1)) : j
+                let t = CGFloat(j) / CGFloat(total - 1)
+                let edge = min(t, 1 - t) / taperSpan
+                let taper = edge >= 1 ? 1 : sin(edge * .pi / 2)
+                points.append(CGPoint(x: left + waveWidth * t, y: baseY + soft[band] * maxHeight * taper))
+            }
+
+            // Smooth curve through the points (Catmull-Rom converted to Bezier segments).
+            line.move(to: points[0])
+            for i in 0..<(points.count - 1) {
+                let p0 = points[max(i - 1, 0)]
+                let p1 = points[i]
+                let p2 = points[i + 1]
+                let p3 = points[min(i + 2, points.count - 1)]
+                let c1 = CGPoint(x: p1.x + (p2.x - p0.x) / 6, y: max(p1.y + (p2.y - p0.y) / 6, baseY))
+                let c2 = CGPoint(x: p2.x - (p3.x - p1.x) / 6, y: max(p2.y - (p3.y - p1.y) / 6, baseY))
+                line.addCurve(to: p2, control1: c1, control2: c2)
+            }
+
+            // Same curve closed along the Dock's top edge: nothing is drawn below that line.
+            fill.addPath(line)
+            fill.addLine(to: CGPoint(x: left + waveWidth, y: baseY))
+            fill.addLine(to: CGPoint(x: left, y: baseY))
+            fill.closeSubpath()
+        }
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        gradient.startPoint = CGPoint(x: left / w, y: 0.5)
+        gradient.endPoint = CGPoint(x: (left + waveWidth) / w, y: 0.5)
+        lineLayer.path = line
+        fillLayer.path = fill
+        CATransaction.commit()
+    }
+}
+
+// MARK: - App
+
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    private let analyzer = SpectrumAnalyzer()
+    private lazy var capture = AudioCapture(analyzer: analyzer)
+    private var windows: [NSWindow] = []
+    private var views: [VisualizerView] = []
+    private var statusItem: NSStatusItem?
+    private var timer: Timer?
+    private var display = [Float](repeating: 0, count: SpectrumAnalyzer.bandCount)
+    private var idle = false
+    private let albumWatcher = AlbumColorWatcher()
+    private var albumColors: [CGColor]?
+    private var dockWidth = estimatedDockWidth()
+    private var frame = 0
+    private var active = false
+    private var volumeTarget: CGFloat = 1
+    private var volumeScale: CGFloat = 1
+
+    private let dimKey = "dimWallpaper"
+    private let widthKey = "waveWidthScale"
+    private let layoutKey = "leftToRight"
+    private var symmetricalItem: NSMenuItem?
+    private var leftToRightItem: NSMenuItem?
+    private let styleKey = "monstercat"          // kept from when this style was called Monstercat
+    private let smoothingKey = "monstercatSmoothing"
+    private var waveItem: NSMenuItem?
+    private var barsItem: NSMenuItem?
+
+    private var widthScale: CGFloat {
+        let stored = UserDefaults.standard.double(forKey: widthKey)
+        return stored > 0 ? CGFloat(stored) : 1
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        buildWindows()
+        buildMenu()
+
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(screensChanged),
+            name: NSApplication.didChangeScreenParametersNotification, object: nil)
+
+        let t = Timer(timeInterval: 1.0 / 60.0, target: self, selector: #selector(tick),
+                      userInfo: nil, repeats: true)
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+
+        if !CGPreflightScreenCaptureAccess() {
+            CGRequestScreenCaptureAccess()
+        }
+        startCapture()
+    }
+
+    // MARK: Windows
+
+    private func buildWindows() {
+        windows.forEach { $0.orderOut(nil) }
+        windows.removeAll()
+        views.removeAll()
+
+        let dimmed = UserDefaults.standard.bool(forKey: dimKey)
+        for screen in NSScreen.screens {
+            let window = NSWindow(contentRect: screen.frame, styleMask: .borderless,
+                                  backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false
+            // Above the wallpaper, below the desktop icons.
+            window.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.desktopWindow)) + 1)
+            window.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
+            window.isOpaque = false
+            window.backgroundColor = .clear
+            window.hasShadow = false
+            window.ignoresMouseEvents = true
+
+            let view = VisualizerView(frame: NSRect(origin: .zero, size: screen.frame.size))
+            view.autoresizingMask = [.width, .height]
+            view.dimmed = dimmed
+            view.dockWidth = dockWidth
+            view.widthScale = widthScale
+            view.heightScale = volumeScale
+            view.mirrored = !UserDefaults.standard.bool(forKey: layoutKey)
+            view.bars = UserDefaults.standard.bool(forKey: styleKey)
+            view.monstercatSmoothing = UserDefaults.standard.bool(forKey: smoothingKey)
+            view.setColors(albumColors)
+            view.setActive(active)
+            window.contentView = view
+            window.setFrame(screen.frame, display: true)
+            window.orderFrontRegardless()
+
+            windows.append(window)
+            views.append(view)
+        }
+        idle = false
+    }
+
+    @objc private func screensChanged() {
+        buildWindows()
+    }
+
+    // MARK: Render loop
+
+    @objc private func tick() {
+        frame += 1
+
+        // Keep the wave matched to the Dock as apps open and close.
+        if frame % 120 == 0 {
+            let width = estimatedDockWidth()
+            if abs(width - dockWidth) > 1 {
+                dockWidth = width
+                views.forEach { $0.dockWidth = width }
+                idle = false
+            }
+        }
+
+        // Louder volume, taller wave. Checked a few times a second and eased so it glides.
+        if frame % 10 == 0 {
+            volumeTarget = CGFloat(pow(systemOutputVolume(), 0.8))
+        }
+        if abs(volumeTarget - volumeScale) > 0.001 {
+            volumeScale += (volumeTarget - volumeScale) * 0.15
+            views.forEach { $0.heightScale = volumeScale }
+        }
+
+        let update = albumWatcher.takeUpdate()
+        if update.changed {
+            albumColors = update.colors
+            views.forEach { $0.setColors(update.colors) }
+        }
+
+        let target = analyzer.snapshot()
+        var peak: Float = 0
+        for i in 0..<display.count {
+            let t = i < target.count ? target[i] : 0
+            if t > display[i] {
+                display[i] += (t - display[i]) * 0.85     // snap up
+            } else {
+                display[i] += (t - display[i]) * 0.22     // drop fast
+            }
+            peak = max(peak, display[i])
+        }
+
+        // Colour only while there is sound.
+        let nowActive = active ? peak > 0.015 : peak > 0.04
+        if nowActive != active {
+            active = nowActive
+            views.forEach { $0.setActive(nowActive) }
+        }
+
+        // Nothing playing: draw the resting state once, then stop touching the layers.
+        if peak < 0.003 {
+            if idle { return }
+            idle = true
+        } else {
+            // Check the album cover when sound starts, then every few seconds while it plays.
+            if idle || frame % 300 == 0 {
+                albumWatcher.poll()
+            }
+            idle = false
+        }
+        views.forEach { $0.update(levels: display) }
+    }
+
+    // MARK: Capture
+
+    private func startCapture() {
+        // macOS shows its own permission dialog; just keep trying until capture is allowed.
+        let capture = self.capture
+        Task.detached {
+            while true {
+                do {
+                    try await capture.start()
+                    return
+                } catch {
+                    try? await Task.sleep(nanoseconds: 4_000_000_000)
+                }
+            }
+        }
+    }
+
+    // MARK: Menu bar
+
+    private func buildMenu() {
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        if let image = NSImage(systemSymbolName: "waveform", accessibilityDescription: "AudioWallpaper") {
+            item.button?.image = image
+        } else {
+            item.button?.title = "♪"
+        }
+
+        let menu = NSMenu()
+
+        let dim = NSMenuItem(title: "Dim Wallpaper", action: #selector(toggleDim(_:)), keyEquivalent: "")
+        dim.target = self
+        dim.state = UserDefaults.standard.bool(forKey: dimKey) ? .on : .off
+        menu.addItem(dim)
+
+        menu.addItem(.separator())
+        let styleLabel = NSMenuItem(title: "Style", action: nil, keyEquivalent: "")
+        styleLabel.isEnabled = false
+        menu.addItem(styleLabel)
+
+        let barsOn = UserDefaults.standard.bool(forKey: styleKey)
+        let wave = NSMenuItem(title: "Wave", action: #selector(chooseWave), keyEquivalent: "")
+        wave.target = self
+        wave.state = barsOn ? .off : .on
+        menu.addItem(wave)
+        waveItem = wave
+
+        let barsChoice = NSMenuItem(title: "Bars", action: #selector(chooseBars), keyEquivalent: "")
+        barsChoice.target = self
+        barsChoice.state = barsOn ? .on : .off
+        menu.addItem(barsChoice)
+        barsItem = barsChoice
+
+        menu.addItem(.separator())
+        let smoothing = NSMenuItem(title: "Monstercat Smoothing", action: #selector(toggleSmoothing(_:)),
+                                   keyEquivalent: "")
+        smoothing.target = self
+        smoothing.state = UserDefaults.standard.bool(forKey: smoothingKey) ? .on : .off
+        menu.addItem(smoothing)
+
+        menu.addItem(.separator())
+        let layoutLabel = NSMenuItem(title: "Wave Layout", action: nil, keyEquivalent: "")
+        layoutLabel.isEnabled = false
+        menu.addItem(layoutLabel)
+
+        let leftToRight = UserDefaults.standard.bool(forKey: layoutKey)
+        let symmetrical = NSMenuItem(title: "Symmetrical", action: #selector(chooseSymmetrical), keyEquivalent: "")
+        symmetrical.target = self
+        symmetrical.state = leftToRight ? .off : .on
+        menu.addItem(symmetrical)
+        symmetricalItem = symmetrical
+
+        let ltr = NSMenuItem(title: "Left to Right", action: #selector(chooseLeftToRight), keyEquivalent: "")
+        ltr.target = self
+        ltr.state = leftToRight ? .on : .off
+        menu.addItem(ltr)
+        leftToRightItem = ltr
+
+        menu.addItem(.separator())
+        let widthLabel = NSMenuItem(title: "Wave Width", action: nil, keyEquivalent: "")
+        widthLabel.isEnabled = false
+        menu.addItem(widthLabel)
+
+        let slider = NSSlider(value: Double(widthScale), minValue: 0.5, maxValue: 1.3,
+                              target: self, action: #selector(widthChanged(_:)))
+        slider.isContinuous = true
+        slider.frame = NSRect(x: 18, y: 4, width: 204, height: 22)
+        let sliderBox = NSView(frame: NSRect(x: 0, y: 0, width: 240, height: 30))
+        sliderBox.addSubview(slider)
+        let sliderItem = NSMenuItem()
+        sliderItem.view = sliderBox
+        menu.addItem(sliderItem)
+        menu.addItem(.separator())
+
+        let login = NSMenuItem(title: "Open at Login", action: #selector(toggleLogin(_:)), keyEquivalent: "")
+        login.target = self
+        login.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        menu.addItem(login)
+
+        menu.addItem(.separator())
+
+        let quit = NSMenuItem(title: "Quit AudioWallpaper", action: #selector(quit), keyEquivalent: "q")
+        quit.target = self
+        menu.addItem(quit)
+
+        item.menu = menu
+        statusItem = item
+    }
+
+    @objc private func toggleDim(_ sender: NSMenuItem) {
+        let on = sender.state != .on
+        sender.state = on ? .on : .off
+        UserDefaults.standard.set(on, forKey: dimKey)
+        views.forEach { $0.dimmed = on }
+    }
+
+    @objc private func chooseWave() {
+        setStyle(bars: false)
+    }
+
+    @objc private func chooseBars() {
+        setStyle(bars: true)
+    }
+
+    private func setStyle(bars: Bool) {
+        UserDefaults.standard.set(bars, forKey: styleKey)
+        waveItem?.state = bars ? .off : .on
+        barsItem?.state = bars ? .on : .off
+        views.forEach { $0.bars = bars }
+        idle = false
+    }
+
+    @objc private func toggleSmoothing(_ sender: NSMenuItem) {
+        let on = sender.state != .on
+        sender.state = on ? .on : .off
+        UserDefaults.standard.set(on, forKey: smoothingKey)
+        views.forEach { $0.monstercatSmoothing = on }
+        idle = false
+    }
+
+    @objc private func chooseSymmetrical() {
+        setLayout(leftToRight: false)
+    }
+
+    @objc private func chooseLeftToRight() {
+        setLayout(leftToRight: true)
+    }
+
+    private func setLayout(leftToRight: Bool) {
+        UserDefaults.standard.set(leftToRight, forKey: layoutKey)
+        symmetricalItem?.state = leftToRight ? .off : .on
+        leftToRightItem?.state = leftToRight ? .on : .off
+        views.forEach { $0.mirrored = !leftToRight }
+        idle = false
+    }
+
+    @objc private func widthChanged(_ sender: NSSlider) {
+        let value = CGFloat(sender.doubleValue)
+        UserDefaults.standard.set(Double(value), forKey: widthKey)
+        views.forEach { $0.widthScale = value }
+        idle = false          // redraw even if nothing is playing
+    }
+
+    @objc private func toggleLogin(_ sender: NSMenuItem) {
+        do {
+            if SMAppService.mainApp.status == .enabled {
+                try SMAppService.mainApp.unregister()
+            } else {
+                try SMAppService.mainApp.register()
+            }
+        } catch {
+            NSSound.beep()
+        }
+        sender.state = SMAppService.mainApp.status == .enabled ? .on : .off
+    }
+
+    @objc private func quit() {
+        NSApp.terminate(nil)
+    }
+}
+
+let app = NSApplication.shared
+let delegate = AppDelegate()
+app.delegate = delegate
+app.setActivationPolicy(.accessory)
+app.run()
