@@ -745,9 +745,13 @@ final class VisualizerView: NSView {
     private var palette: [CGColor]?
     private var active = false
 
-    var dimmed = false {
+    /// How much the wallpaper behind is darkened: 0 = not at all, 0.95 = almost black.
+    var dimAmount: CGFloat = 0 {
         didSet {
-            backdrop.backgroundColor = NSColor.black.withAlphaComponent(dimmed ? 0.45 : 0).cgColor
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            backdrop.backgroundColor = NSColor.black.withAlphaComponent(dimAmount).cgColor
+            CATransaction.commit()
         }
     }
 
@@ -1195,7 +1199,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var volumeTarget: CGFloat = 1
     private var volumeScale: CGFloat = 1
 
-    private let dimKey = "dimWallpaper"
+    private let dimKey = "dimWallpaper"          // older on/off setting
+    private let dimAmountKey = "dimAmount"
+
+    private var dimAmount: CGFloat {
+        let defaults = UserDefaults.standard
+        if let stored = defaults.object(forKey: dimAmountKey) as? Double {
+            return CGFloat(stored)
+        }
+        return defaults.bool(forKey: dimKey) ? 0.45 : 0      // carry over the old switch
+    }
     private let widthKey = "waveWidthScale"
     private let layoutKey = "leftToRight"
     private var symmetricalItem: NSMenuItem?
@@ -1258,7 +1271,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         windows.removeAll()
         views.removeAll()
 
-        let dimmed = UserDefaults.standard.bool(forKey: dimKey)
+        let dimmed = dimAmount
         for screen in NSScreen.screens {
             let window = NSWindow(contentRect: screen.frame, styleMask: .borderless,
                                   backing: .buffered, defer: false)
@@ -1273,7 +1286,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
             let view = VisualizerView(frame: NSRect(origin: .zero, size: screen.frame.size))
             view.autoresizingMask = [.width, .height]
-            view.dimmed = dimmed
+            view.dimAmount = dimmed
             view.dockWidth = dockWidth
             view.widthScale = widthScale
             view.heightScale = volumeScale
@@ -1400,10 +1413,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let menu = NSMenu()
 
-        let dim = NSMenuItem(title: "Dim Wallpaper", action: #selector(toggleDim(_:)), keyEquivalent: "")
-        dim.target = self
-        dim.state = UserDefaults.standard.bool(forKey: dimKey) ? .on : .off
-        menu.addItem(dim)
+        let dimLabel = NSMenuItem(title: "Dim Wallpaper", action: nil, keyEquivalent: "")
+        dimLabel.isEnabled = false
+        menu.addItem(dimLabel)
+
+        let dimSlider = NSSlider(value: Double(dimAmount), minValue: 0, maxValue: 0.95,
+                                 target: self, action: #selector(dimChanged(_:)))
+        dimSlider.isContinuous = true
+        dimSlider.frame = NSRect(x: 18, y: 4, width: 204, height: 22)
+        let dimBox = NSView(frame: NSRect(x: 0, y: 0, width: 240, height: 30))
+        dimBox.addSubview(dimSlider)
+        let dimItem = NSMenuItem()
+        dimItem.view = dimBox
+        menu.addItem(dimItem)
 
         menu.addItem(.separator())
         let styleLabel = NSMenuItem(title: "Style", action: nil, keyEquivalent: "")
@@ -1551,11 +1573,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = item
     }
 
-    @objc private func toggleDim(_ sender: NSMenuItem) {
-        let on = sender.state != .on
-        sender.state = on ? .on : .off
-        UserDefaults.standard.set(on, forKey: dimKey)
-        views.forEach { $0.dimmed = on }
+    @objc private func dimChanged(_ sender: NSSlider) {
+        let value = CGFloat(sender.doubleValue)
+        UserDefaults.standard.set(Double(value), forKey: dimAmountKey)
+        views.forEach { $0.dimAmount = value }
     }
 
     @objc private func chooseStyle(_ sender: NSMenuItem) {

@@ -1,0 +1,96 @@
+name: Rust builds
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths: ["rust/**", ".github/workflows/rust.yml"]
+  pull_request:
+    paths: ["rust/**", ".github/workflows/rust.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos
+            os: macos-14
+          - name: windows
+            os: windows-latest
+          - name: linux
+            os: ubuntu-22.04
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.name == 'macos' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Install Linux build dependencies
+        if: matrix.name == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libasound2-dev libdbus-1-dev libxkbcommon-dev libwayland-dev \
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev libgl1-mesa-dev
+
+      - name: Build macOS app (Apple Silicon + Intel)
+        if: matrix.name == 'macos'
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "13.0"
+        run: |
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+          APP=dist/AudioWallpaper.app
+          mkdir -p "$APP/Contents/MacOS"
+          lipo -create -output "$APP/Contents/MacOS/AudioWallpaper" \
+            target/aarch64-apple-darwin/release/audiowallpaper \
+            target/x86_64-apple-darwin/release/audiowallpaper
+          cp packaging/macos/Info.plist "$APP/Contents/Info.plist"
+          codesign --force --sign - -r='designated => identifier "local.audiowallpaper"' "$APP"
+          cd dist && ditto -c -k --keepParent AudioWallpaper.app AudioWallpaper-macos.zip
+
+      - name: Build Windows exe
+        if: matrix.name == 'windows'
+        shell: pwsh
+        run: |
+          cargo build --release
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/audiowallpaper.exe dist/AudioWallpaper.exe
+          Compress-Archive -Path dist/AudioWallpaper.exe -DestinationPath dist/AudioWallpaper-windows.zip -Force
+
+      - name: Build Linux binary
+        if: matrix.name == 'linux'
+        run: |
+          cargo build --release
+          mkdir -p dist
+          cp target/release/audiowallpaper dist/audiowallpaper
+          tar -C dist -czf dist/AudioWallpaper-linux-x86_64.tar.gz audiowallpaper
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AudioWallpaper-${{ matrix.name }}
+          path: |
+            rust/dist/AudioWallpaper-*.zip
+            rust/dist/AudioWallpaper-*.tar.gz
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            rust/dist/AudioWallpaper-*.zip
+            rust/dist/AudioWallpaper-*.tar.gz
