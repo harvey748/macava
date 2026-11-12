@@ -1,0 +1,63 @@
+[package]
+name = "audiowallpaper"
+version = "0.1.0"
+edition = "2021"
+description = "A live audio visualiser that sits on your desktop, behind your icons"
+build = "build.rs"
+
+[[bin]]
+name = "audiowallpaper"
+path = "src/main.rs"
+
+[dependencies]
+winit = "0.30"
+raw-window-handle = "0.6"
+tiny-skia = "0.11"
+rustfft = "6.2"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "webp"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "5"
+eframe = "0.31"
+ureq = "2"
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+cpal = "0.15"
+softbuffer = "0.4"
+
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+tray-icon = "0.19"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+] }
+windows = { version = "0.58", features = [
+    "Foundation",
+    "Foundation_Collections",
+    "Media_Control",
+    "Storage_Streams",
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = "0.2"
+mpris = "2"
+smithay-client-toolkit = { version = "0.19", default-features = false }
+wayland-client = "0.31"
+libc = "0.2"
+
+[build-dependencies]
+cc = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
