@@ -540,6 +540,120 @@ func estimatedDockWidth() -> CGFloat {
 
 // MARK: - Drawing
 
+enum WaveStyle: Int {
+    case wave = 0, bars = 1, orb = 2
+}
+
+enum OrbShape: Int, CaseIterable {
+    case sphere = 0, cube, donut, diamond, helix
+
+    var title: String {
+        switch self {
+        case .sphere: return "Sphere"
+        case .cube: return "Cube"
+        case .donut: return "Donut"
+        case .diamond: return "Diamond"
+        case .helix: return "Double Helix"
+        }
+    }
+}
+
+/// One dot of a 3D shape. `v` is its height within the shape, -1 (bottom) to 1 (top),
+/// used to decide which slice of the sound moves it.
+struct ShapePoint {
+    var x: CGFloat
+    var y: CGFloat
+    var z: CGFloat
+    var v: CGFloat = 0
+}
+
+/// Builds the cloud of dots for each shape, sized to fit roughly inside a ball of radius 1.
+func makeShapePoints(_ shape: OrbShape) -> [ShapePoint] {
+    var points: [ShapePoint] = []
+    let golden = CGFloat.pi * (3 - CGFloat(5).squareRoot())
+
+    // Dots spread evenly over a ball; several shapes start from this.
+    func spherePoints(_ count: Int) -> [ShapePoint] {
+        var result: [ShapePoint] = []
+        for k in 0..<count {
+            let y = 1 - 2 * (CGFloat(k) + 0.5) / CGFloat(count)
+            let r = (1 - y * y).squareRoot()
+            let phi = CGFloat(k) * golden
+            result.append(ShapePoint(x: cos(phi) * r, y: y, z: sin(phi) * r))
+        }
+        return result
+    }
+
+    switch shape {
+    case .sphere:
+        points = spherePoints(720)
+
+    case .cube:
+        // A grid of dots on each of the six faces.
+        let steps = 11
+        let half: CGFloat = 0.68
+        for i in 0..<steps {
+            for j in 0..<steps {
+                let a = (CGFloat(i) / CGFloat(steps - 1) * 2 - 1) * half
+                let b = (CGFloat(j) / CGFloat(steps - 1) * 2 - 1) * half
+                points.append(ShapePoint(x: a, y: b, z: half))
+                points.append(ShapePoint(x: a, y: b, z: -half))
+                points.append(ShapePoint(x: half, y: a, z: b))
+                points.append(ShapePoint(x: -half, y: a, z: b))
+                points.append(ShapePoint(x: a, y: half, z: b))
+                points.append(ShapePoint(x: a, y: -half, z: b))
+            }
+        }
+
+    case .donut:
+        // An upright ring facing the viewer.
+        let around = 44, tube = 16
+        let major: CGFloat = 0.72, minor: CGFloat = 0.28
+        for i in 0..<around {
+            let u = CGFloat(i) / CGFloat(around) * 2 * .pi
+            for j in 0..<tube {
+                let t = CGFloat(j) / CGFloat(tube) * 2 * .pi
+                let ring = major + minor * cos(t)
+                points.append(ShapePoint(x: ring * cos(u), y: ring * sin(u), z: minor * sin(t)))
+            }
+        }
+
+    case .diamond:
+        // Ball dots pushed onto the faces of an eight-sided gem.
+        for p in spherePoints(720) {
+            let sum = abs(p.x) + abs(p.y) + abs(p.z)
+            let scale = 1.05 / max(sum, 0.0001)
+            points.append(ShapePoint(x: p.x * scale, y: p.y * scale, z: p.z * scale))
+        }
+
+    case .helix:
+        // Two twisting strands joined by rungs, like DNA.
+        let steps = 240
+        let turns: CGFloat = 2.5
+        let radius: CGFloat = 0.42
+        for k in 0..<steps {
+            let t = CGFloat(k) / CGFloat(steps - 1)
+            let y = (1 - 2 * t) * 0.98
+            let angle = t * turns * 2 * .pi
+            let ax = cos(angle) * radius, az = sin(angle) * radius
+            points.append(ShapePoint(x: ax, y: y, z: az))
+            points.append(ShapePoint(x: -ax, y: y, z: -az))
+            if k % 10 == 0 {
+                for r in 1..<8 {
+                    let f = CGFloat(r) / 8 * 2 - 1
+                    points.append(ShapePoint(x: ax * f, y: y, z: az * f))
+                }
+            }
+        }
+    }
+
+    // Record each dot's relative height.
+    var top: CGFloat = 0.0001
+    for p in points { top = max(top, abs(p.y)) }
+    for i in points.indices { points[i].v = points[i].y / top }
+    return points
+}
+
 final class VisualizerView: NSView {
     private let backdrop = CALayer()
     private let gradient = CAGradientLayer()
@@ -565,9 +679,20 @@ final class VisualizerView: NSView {
     var widthScale: CGFloat = 1          // fine-tuning from the menu bar slider
     var heightScale: CGFloat = 1         // follows the Mac's volume
     var mirrored = true                  // true: bass in the middle; false: bass left, treble right
-    var bars = false {                   // true: solid bars instead of a wave
+    var style: WaveStyle = .wave {
         didSet { applyAppearance(duration: 0.3) }
     }
+    private var bars: Bool { style == .bars }
+
+    // Orb: dots spread evenly over a sphere, drawn in three depth layers (far, middle, near).
+    private let orbLayers = [CAShapeLayer(), CAShapeLayer(), CAShapeLayer()]
+    private var orbAngle: CGFloat = 0
+    private var lastOrbTime: CFTimeInterval = 0
+    var shape: OrbShape = .sphere
+    var shapeScale: CGFloat = 1          // size slider for the 3D shapes
+    var orbitCount = 0                   // how many small copies circle the main shape
+    private var orbitAngle: CGFloat = 0
+    private static let shapePoints: [[ShapePoint]] = OrbShape.allCases.map { makeShapePoints($0) }
     var monstercatSmoothing = false      // loud bands lift their neighbours into rounded hills
     private var palette: [CGColor]?
     private var active = false
@@ -597,6 +722,12 @@ final class VisualizerView: NSView {
         lineLayer.lineCap = .round
         waveMask.addSublayer(fillLayer)
         waveMask.addSublayer(lineLayer)
+        let orbAlphas: [CGFloat] = [0.28, 0.60, 1.0]
+        for (index, orbLayer) in orbLayers.enumerated() {
+            orbLayer.fillColor = NSColor.white.withAlphaComponent(orbAlphas[index]).cgColor
+            orbLayer.isHidden = true
+            waveMask.addSublayer(orbLayer)
+        }
         gradient.mask = waveMask
 
         layer?.addSublayer(backdrop)
@@ -616,6 +747,7 @@ final class VisualizerView: NSView {
         waveMask.frame = bounds
         fillLayer.frame = bounds
         lineLayer.frame = bounds
+        orbLayers.forEach { $0.frame = bounds }
         CATransaction.commit()
     }
 
@@ -640,6 +772,13 @@ final class VisualizerView: NSView {
         CATransaction.begin()
         CATransaction.setAnimationDuration(duration)
         gradient.colors = active ? (palette ?? VisualizerView.defaultColors) : VisualizerView.restingColors
+        let orb = style == .orb
+        fillLayer.isHidden = orb
+        lineLayer.isHidden = orb
+        for orbLayer in orbLayers {
+            orbLayer.isHidden = !orb
+            if !orb { orbLayer.path = nil }
+        }
         if bars {
             fillLayer.fillColor = NSColor.white.cgColor
             fillLayer.opacity = 1
@@ -703,6 +842,11 @@ final class VisualizerView: NSView {
             }
         }
 
+        if style == .orb {
+            drawOrb(soft, width: w, height: h, baseY: baseY)
+            return
+        }
+
         // Symmetrical: bass in the middle of the Dock, treble out to both ends.
         // Left to right: bass at the left end, treble at the right.
         let total = mirrored ? 2 * n - 1 : n
@@ -759,6 +903,112 @@ final class VisualizerView: NSView {
         fillLayer.path = fill
         CATransaction.commit()
     }
+
+    /// A slowly spinning ball of dots in the middle of the screen. Each ring of dots swells with
+    /// its slice of the sound, and the whole ball spins faster as the music gets busier.
+    private func drawOrb(_ soft: [CGFloat], width w: CGFloat, height h: CGFloat, baseY: CGFloat) {
+        let now = CACurrentMediaTime()
+        let dt = CGFloat(min(max(now - lastOrbTime, 0), 0.05))
+        lastOrbTime = now
+
+        let n = soft.count
+        var energy: CGFloat = 0
+        for value in soft { energy += value }
+        energy /= CGFloat(n)
+        let bassCount = min(6, n)
+        var bass: CGFloat = 0
+        for i in 0..<bassCount { bass += soft[i] }
+        bass /= CGFloat(bassCount)
+
+        orbAngle += dt * (0.35 + energy * 1.6)
+        if orbAngle > 2 * .pi { orbAngle -= 2 * .pi }
+        orbitAngle -= dt * (0.45 + energy * 1.0)      // moons travel the opposite way round
+        if orbitAngle < -2 * .pi { orbitAngle += 2 * .pi }
+
+        let cx = w / 2
+        let cy = baseY + (h - baseY) / 2
+        let radius = min(w, h - baseY) * 0.17 * shapeScale * (1 + bass * 0.10 * heightScale)
+        let cosA = cos(orbAngle), sinA = sin(orbAngle)
+        let tilt: CGFloat = 0.38                     // lean towards the viewer so the top is visible
+        let cosT = cos(tilt), sinT = sin(tilt)
+
+        let paths = [CGMutablePath(), CGMutablePath(), CGMutablePath()]
+        for p in VisualizerView.shapePoints[shape.rawValue] {
+            // Symmetrical: bass around the middle, treble at both poles. Otherwise bass at the bottom, treble on top.
+            let lat = mirrored ? abs(p.v) : (p.v + 1) / 2
+            let band = min(Int(lat * CGFloat(n - 1)), n - 1)
+            let level = soft[band]
+            let swell = 1 + level * 0.55 * heightScale
+
+            // Spin around the vertical axis, then tilt.
+            let x1 = p.x * cosA + p.z * sinA
+            let z1 = -p.x * sinA + p.z * cosA
+            let y2 = p.y * cosT - z1 * sinT
+            let z2 = p.y * sinT + z1 * cosT
+
+            // Nearer dots are drawn larger, further apart and brighter.
+            let perspective = 1 / (1 - z2 * 0.28)
+            let px = cx + x1 * swell * radius * perspective
+            let py = cy + y2 * swell * radius * perspective
+            let size = (1.3 + level * 1.8) * perspective
+            let depth = z2 < -0.3 ? 0 : (z2 < 0.3 ? 1 : 2)
+            paths[depth].addEllipse(in: CGRect(x: px - size, y: py - size, width: size * 2, height: size * 2))
+        }
+
+        // Small copies of the shape circling the main one on differently angled orbits,
+        // each pulsing with its own slice of the sound.
+        if orbitCount > 0 {
+            let all = VisualizerView.shapePoints[shape.rawValue]
+            let spin = orbAngle * 2.3
+            let cosS = cos(spin), sinS = sin(spin)
+            let distance: CGFloat = 2.05
+            for moon in 0..<orbitCount {
+                let theta = orbitAngle + CGFloat(moon) / CGFloat(orbitCount) * 2 * .pi
+                let band = min(moon * n / orbitCount + n / (2 * orbitCount), n - 1)
+                let mini = 0.20 * (1 + soft[band] * 0.7 * heightScale)
+
+                // Give every moon its own orbital plane: lean the circle over by a different
+                // amount for each one, then swing it round to face a different direction.
+                let lean = CGFloat.pi * CGFloat(moon) / CGFloat(orbitCount)
+                let swing = CGFloat(moon) * 2.4
+                let flatX = cos(theta) * distance
+                let flatZ = sin(theta) * distance
+                let leanedX = flatX * cos(lean)
+                let oy = flatX * sin(lean)
+                let ox = leanedX * cos(swing) + flatZ * sin(swing)
+                let oz = -leanedX * sin(swing) + flatZ * cos(swing)
+                let centreDepth = oy * sinT + oz * cosT
+                let depth = centreDepth < -0.6 ? 0 : (centreDepth < 0.6 ? 1 : 2)
+
+                var index = moon % 5
+                while index < all.count {
+                    let p = all[index]
+                    index += 5
+                    let lx = (p.x * cosS + p.z * sinS) * mini + ox
+                    let lz = (-p.x * sinS + p.z * cosS) * mini + oz
+                    let ly = p.y * mini + oy
+                    let y2 = ly * cosT - lz * sinT
+                    let z2 = ly * sinT + lz * cosT
+                    let perspective = 1 / (1 - z2 * 0.14)
+                    let px = cx + lx * radius * perspective
+                    let py = cy + y2 * radius * perspective
+                    let size = 1.1 * perspective
+                    paths[depth].addEllipse(in: CGRect(x: px - size, y: py - size,
+                                                       width: size * 2, height: size * 2))
+                }
+            }
+        }
+
+        let span = radius * (orbitCount > 0 ? 2.6 : 1.7)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        gradient.startPoint = CGPoint(x: (cx - span) / w, y: 0.5)
+        gradient.endPoint = CGPoint(x: (cx + span) / w, y: 0.5)
+        for (index, orbLayer) in orbLayers.enumerated() {
+            orbLayer.path = paths[index]
+        }
+        CATransaction.commit()
+    }
 }
 
 // MARK: - App
@@ -785,10 +1035,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let layoutKey = "leftToRight"
     private var symmetricalItem: NSMenuItem?
     private var leftToRightItem: NSMenuItem?
-    private let styleKey = "monstercat"          // kept from when this style was called Monstercat
+    private let styleKey = "monstercat"          // older on/off setting for the Bars style
+    private let styleNameKey = "waveStyle"
     private let smoothingKey = "monstercatSmoothing"
-    private var waveItem: NSMenuItem?
-    private var barsItem: NSMenuItem?
+    private var styleItems: [NSMenuItem] = []
+    private var style: WaveStyle = .wave
+    private let shapeKey = "orbShape"
+    private var shapeItems: [NSMenuItem] = []
+    private var shape: OrbShape = .sphere
+    private let shapeSizeKey = "shapeScale"
+    private let orbitKey = "orbitCount"
+    private var orbitItems: [NSMenuItem] = []
+
+    private var shapeScale: CGFloat {
+        let stored = UserDefaults.standard.double(forKey: shapeSizeKey)
+        return stored > 0 ? CGFloat(stored) : 1
+    }
+
+    private var savedStyle: WaveStyle {
+        let defaults = UserDefaults.standard
+        if let raw = defaults.object(forKey: styleNameKey) as? Int, let saved = WaveStyle(rawValue: raw) {
+            return saved
+        }
+        return defaults.bool(forKey: styleKey) ? .bars : .wave
+    }
 
     private var widthScale: CGFloat {
         let stored = UserDefaults.standard.double(forKey: widthKey)
@@ -796,6 +1066,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        style = savedStyle
+        shape = OrbShape(rawValue: UserDefaults.standard.integer(forKey: shapeKey)) ?? .sphere
         buildWindows()
         buildMenu()
 
@@ -841,7 +1113,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             view.widthScale = widthScale
             view.heightScale = volumeScale
             view.mirrored = !UserDefaults.standard.bool(forKey: layoutKey)
-            view.bars = UserDefaults.standard.bool(forKey: styleKey)
+            view.shape = shape
+            view.shapeScale = shapeScale
+            view.orbitCount = UserDefaults.standard.integer(forKey: orbitKey)
+            view.style = style
             view.monstercatSmoothing = UserDefaults.standard.bool(forKey: smoothingKey)
             view.setColors(albumColors)
             view.setActive(active)
@@ -910,7 +1185,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Nothing playing: draw the resting state once, then stop touching the layers.
         if peak < 0.003 {
-            if idle { return }
+            if idle && style != .orb { return }     // the orb keeps spinning in silence
             idle = true
         } else {
             // Check the album cover when sound starts, then every few seconds while it plays.
@@ -961,18 +1236,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         styleLabel.isEnabled = false
         menu.addItem(styleLabel)
 
-        let barsOn = UserDefaults.standard.bool(forKey: styleKey)
-        let wave = NSMenuItem(title: "Wave", action: #selector(chooseWave), keyEquivalent: "")
-        wave.target = self
-        wave.state = barsOn ? .off : .on
-        menu.addItem(wave)
-        waveItem = wave
+        let choices: [(String, WaveStyle)] = [("Wave", .wave), ("Bars", .bars)]
+        for (title, value) in choices {
+            let item = NSMenuItem(title: title, action: #selector(chooseStyle(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = value.rawValue
+            item.state = value == style ? .on : .off
+            menu.addItem(item)
+            styleItems.append(item)
+        }
 
-        let barsChoice = NSMenuItem(title: "Bars", action: #selector(chooseBars), keyEquivalent: "")
-        barsChoice.target = self
-        barsChoice.state = barsOn ? .on : .off
-        menu.addItem(barsChoice)
-        barsItem = barsChoice
+        // Third style: a spinning 3D shape, picked from a drop-down.
+        let shapeParent = NSMenuItem(title: "3D Shape", action: nil, keyEquivalent: "")
+        shapeParent.tag = WaveStyle.orb.rawValue
+        shapeParent.state = style == .orb ? .on : .off
+        let shapeMenu = NSMenu()
+        for option in OrbShape.allCases {
+            let item = NSMenuItem(title: option.title, action: #selector(chooseShape(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = option.rawValue
+            item.state = (style == .orb && option == shape) ? .on : .off
+            shapeMenu.addItem(item)
+            shapeItems.append(item)
+        }
+        shapeParent.submenu = shapeMenu
+        menu.addItem(shapeParent)
+        styleItems.append(shapeParent)
+
+        // How many small copies orbit the 3D shape.
+        let orbitParent = NSMenuItem(title: "Orbiting Shapes", action: nil, keyEquivalent: "")
+        let orbitMenu = NSMenu()
+        let savedOrbit = UserDefaults.standard.integer(forKey: orbitKey)
+        for count in 0...8 {
+            let item = NSMenuItem(title: count == 0 ? "None" : "\(count)",
+                                  action: #selector(chooseOrbitCount(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = count
+            item.state = count == savedOrbit ? .on : .off
+            orbitMenu.addItem(item)
+            orbitItems.append(item)
+        }
+        orbitParent.submenu = orbitMenu
+        menu.addItem(orbitParent)
 
         menu.addItem(.separator())
         let smoothing = NSMenuItem(title: "Monstercat Smoothing", action: #selector(toggleSmoothing(_:)),
@@ -1013,6 +1318,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let sliderItem = NSMenuItem()
         sliderItem.view = sliderBox
         menu.addItem(sliderItem)
+
+        let sizeLabel = NSMenuItem(title: "3D Shape Size", action: nil, keyEquivalent: "")
+        sizeLabel.isEnabled = false
+        menu.addItem(sizeLabel)
+
+        let sizeSlider = NSSlider(value: Double(shapeScale), minValue: 0.4, maxValue: 2.5,
+                                  target: self, action: #selector(shapeSizeChanged(_:)))
+        sizeSlider.isContinuous = true
+        sizeSlider.frame = NSRect(x: 18, y: 4, width: 204, height: 22)
+        let sizeBox = NSView(frame: NSRect(x: 0, y: 0, width: 240, height: 30))
+        sizeBox.addSubview(sizeSlider)
+        let sizeItem = NSMenuItem()
+        sizeItem.view = sizeBox
+        menu.addItem(sizeItem)
         menu.addItem(.separator())
 
         let login = NSMenuItem(title: "Open at Login", action: #selector(toggleLogin(_:)), keyEquivalent: "")
@@ -1037,19 +1356,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         views.forEach { $0.dimmed = on }
     }
 
-    @objc private func chooseWave() {
-        setStyle(bars: false)
+    @objc private func chooseStyle(_ sender: NSMenuItem) {
+        guard let newStyle = WaveStyle(rawValue: sender.tag) else { return }
+        style = newStyle
+        UserDefaults.standard.set(newStyle.rawValue, forKey: styleNameKey)
+        styleItems.forEach { $0.state = $0.tag == newStyle.rawValue ? .on : .off }
+        shapeItems.forEach { $0.state = .off }
+        views.forEach { $0.style = newStyle }
+        idle = false
     }
 
-    @objc private func chooseBars() {
-        setStyle(bars: true)
-    }
-
-    private func setStyle(bars: Bool) {
-        UserDefaults.standard.set(bars, forKey: styleKey)
-        waveItem?.state = bars ? .off : .on
-        barsItem?.state = bars ? .on : .off
-        views.forEach { $0.bars = bars }
+    @objc private func chooseShape(_ sender: NSMenuItem) {
+        guard let newShape = OrbShape(rawValue: sender.tag) else { return }
+        shape = newShape
+        style = .orb
+        UserDefaults.standard.set(newShape.rawValue, forKey: shapeKey)
+        UserDefaults.standard.set(WaveStyle.orb.rawValue, forKey: styleNameKey)
+        styleItems.forEach { $0.state = $0.tag == WaveStyle.orb.rawValue ? .on : .off }
+        shapeItems.forEach { $0.state = $0.tag == newShape.rawValue ? .on : .off }
+        views.forEach {
+            $0.shape = newShape
+            $0.style = .orb
+        }
         idle = false
     }
 
@@ -1074,6 +1402,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         symmetricalItem?.state = leftToRight ? .off : .on
         leftToRightItem?.state = leftToRight ? .on : .off
         views.forEach { $0.mirrored = !leftToRight }
+        idle = false
+    }
+
+    @objc private func chooseOrbitCount(_ sender: NSMenuItem) {
+        let count = sender.tag
+        UserDefaults.standard.set(count, forKey: orbitKey)
+        orbitItems.forEach { $0.state = $0.tag == count ? .on : .off }
+        views.forEach { $0.orbitCount = count }
+        idle = false
+    }
+
+    @objc private func shapeSizeChanged(_ sender: NSSlider) {
+        let value = CGFloat(sender.doubleValue)
+        UserDefaults.standard.set(Double(value), forKey: shapeSizeKey)
+        views.forEach { $0.shapeScale = value }
         idle = false
     }
 
